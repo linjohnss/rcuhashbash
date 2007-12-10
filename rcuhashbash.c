@@ -9,19 +9,27 @@
 #include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 
 MODULE_AUTHOR("Josh Triplett <josh@kernel.org>");
 MODULE_DESCRIPTION("RCU hash algorithm test module.");
 MODULE_LICENSE("GPL");
 
+static char *reader_type = "rcu"; /* Reader implementation to benchmark */
+static char *writer_type = "single"; /* Writer implementation to benchmark */
 static int readers = -1; /* Number of reader tasks; defaults to online CPUs */
 static unsigned long buckets = 1024; /* Number of hash table buckets */
 static unsigned long entries = 4096; /* Number of entries initially added */
 
+module_param(reader_type, charp, 0444);
+MODULE_PARM_DESC(reader_type, "Hash table reader implementation");
+module_param(writer_type, charp, 0444);
+MODULE_PARM_DESC(writer_type, "Hash table writer implementation");
 module_param(readers, int, 0444);
 MODULE_PARM_DESC(readers, "Number of reader threads");
 module_param(buckets, ulong, 0444);
@@ -29,7 +37,31 @@ MODULE_PARM_DESC(buckets, "Number of hash buckets");
 module_param(entries, ulong, 0444);
 MODULE_PARM_DESC(entries, "Number of hash table entries");
 
-static struct hlist_head *hash_table;
+struct rcuhashbash_bucket {
+	struct hlist_head head;
+	union {
+		spinlock_t spinlock;
+		rwlock_t rwlock;
+		struct mutex mutex;
+	};
+};
+
+struct rcuhashbash_ops {
+	void (*init_bucket)(struct rcuhashbash_bucket *);
+	void (*write_lock_buckets)(struct rcuhashbash_bucket *, struct rcuhashbash_bucket *);
+	void (*write_unlock_buckets)(struct rcuhashbash_bucket *, struct rcuhashbash_bucket *);
+	int max_writers;
+	const char *reader_type;
+	const char *writer_type;
+};
+
+static struct rcuhashbash_ops *ops;
+
+static DEFINE_SPINLOCK(table_spinlock);
+static DEFINE_RWLOCK(table_rwlock);
+static DEFINE_MUTEX(table_mutex);
+
+static struct rcuhashbash_bucket *hash_table;
 
 struct rcuhashbash_entry {
 	struct hlist_node node;
@@ -100,7 +132,7 @@ static int rcuhashbash_reader(void *arg)
 		value = rcu_random(&rand) % (entries * 2);
 
 		rcu_read_lock();
-		hlist_for_each_entry_rcu(entry, node, &hash_table[value % buckets], node)
+		hlist_for_each_entry_rcu(entry, node, &hash_table[value % buckets].head, node)
 			if (entry->value == value)
 				break;
 		if (node)
@@ -122,6 +154,7 @@ static void rcuhashbash_entry_cb(struct rcu_head *rcu_head)
 
 static int rcuhashbash_writer(void *arg)
 {
+	int err = 0;
 	struct writer_stats *stats = arg;
 	DEFINE_RCU_RANDOM(rand);
 
@@ -147,9 +180,13 @@ static int rcuhashbash_writer(void *arg)
 		dst_bucket = dst_value % buckets;
 		same_bucket = src_bucket == dst_bucket;
 
+		if (ops->write_lock_buckets)
+			ops->write_lock_buckets(&hash_table[src_bucket],
+			                        &hash_table[dst_bucket]);
+
 		/* Find src_tail and src_entry. */
-		src_tail = &(hash_table[src_bucket].first);
-		hlist_for_each_entry(entry, node, &hash_table[src_bucket], node) {
+		src_tail = &(hash_table[src_bucket].head.first);
+		hlist_for_each_entry(entry, node, &hash_table[src_bucket].head, node) {
 			if (entry->value == src_value)
 				src_entry = entry;
 			if (same_bucket && entry->value == dst_value)
@@ -159,22 +196,22 @@ static int rcuhashbash_writer(void *arg)
 		}
 		if (!src_entry) {
 			stats->misses++;
-			continue;
+			goto unlock_and_loop;
 		}
 		if (dest_in_use) {
 			stats->dests_in_use++;
-			continue;
+			goto unlock_and_loop;
 		}
 
 		if (same_bucket) {
 			src_entry->value = dst_value;
 			stats->moves++;
-			continue;
+			goto unlock_and_loop;
 		}
 
 		/* Find dst_tail and check for existing destination. */
-		dst_tail = &(hash_table[dst_bucket].first);
-		hlist_for_each_entry(entry, node, &hash_table[dst_bucket], node) {
+		dst_tail = &(hash_table[dst_bucket].head.first);
+		hlist_for_each_entry(entry, node, &hash_table[dst_bucket].head, node) {
 			if (entry->value == dst_value) {
 				dest_in_use = true;
 				break;
@@ -184,15 +221,17 @@ static int rcuhashbash_writer(void *arg)
 		}
 		if (dest_in_use) {
 			stats->dests_in_use++;
-			continue;
+			goto unlock_and_loop;
 		}
 
 		/* Move the entry to the end of its bucket. */
 		if (src_entry->node.next) {
 			old_entry = src_entry;
 			src_entry = kmem_cache_zalloc(entry_cache, GFP_KERNEL);
-			if (!src_entry)
-				goto enomem;
+			if (!src_entry) {
+				err = -ENOMEM;
+				goto unlock_and_loop;
+			}
 			src_entry->value = old_entry->value;
 			src_entry->node.pprev = src_tail;
 			smp_wmb(); /* Initialization must appear before insertion */
@@ -211,15 +250,183 @@ static int rcuhashbash_writer(void *arg)
 		src_entry->node.pprev = dst_tail;
 
 		stats->moves++;
-	} while (!kthread_should_stop());
 
-	return 0;
+unlock_and_loop:
+		if (ops->write_unlock_buckets)
+			ops->write_unlock_buckets(&hash_table[src_bucket],
+			                          &hash_table[dst_bucket]);
+	} while (!kthread_should_stop() && !err);
 
-enomem:
 	while (!kthread_should_stop())
 		schedule_timeout_interruptible(1);
-	return -ENOMEM;
+	return err;
 }
+
+static void spinlock_init_bucket(struct rcuhashbash_bucket *bucket)
+{
+	spin_lock_init(&bucket->spinlock);
+}
+
+static void rwlock_init_bucket(struct rcuhashbash_bucket *bucket)
+{
+	rwlock_init(&bucket->rwlock);
+}
+
+static void mutex_init_bucket(struct rcuhashbash_bucket *bucket)
+{
+	mutex_init(&bucket->mutex);
+}
+
+static void spinlock_write_lock_buckets(struct rcuhashbash_bucket *b1,
+                                        struct rcuhashbash_bucket *b2)
+{
+	if (b1 == b2)
+		spin_lock(&b1->spinlock);
+	else if (b1 < b2) {
+		spin_lock(&b1->spinlock);
+		spin_lock_nested(&b2->spinlock, SINGLE_DEPTH_NESTING);
+	} else {
+		spin_lock(&b2->spinlock);
+		spin_lock_nested(&b1->spinlock, SINGLE_DEPTH_NESTING);
+	}
+}
+
+static void rwlock_write_lock_buckets(struct rcuhashbash_bucket *b1,
+                                      struct rcuhashbash_bucket *b2)
+{
+	if (b1 == b2)
+		write_lock(&b1->rwlock);
+	else if (b1 < b2) {
+		write_lock(&b1->rwlock);
+		write_lock(&b2->rwlock);
+	} else {
+		write_lock(&b2->rwlock);
+		write_lock(&b1->rwlock);
+	}
+}
+
+static void mutex_write_lock_buckets(struct rcuhashbash_bucket *b1,
+                                     struct rcuhashbash_bucket *b2)
+{
+	if (b1 == b2)
+		mutex_lock(&b1->mutex);
+	else if (b1 < b2) {
+		mutex_lock(&b1->mutex);
+		mutex_lock_nested(&b2->mutex, SINGLE_DEPTH_NESTING);
+	} else {
+		mutex_lock(&b2->mutex);
+		mutex_lock_nested(&b1->mutex, SINGLE_DEPTH_NESTING);
+	}
+}
+
+static void table_spinlock_write_lock_buckets(struct rcuhashbash_bucket *b1,
+                                              struct rcuhashbash_bucket *b2)
+{
+	spin_lock(&table_spinlock);
+}
+
+static void table_rwlock_write_lock_buckets(struct rcuhashbash_bucket *b1,
+                                            struct rcuhashbash_bucket *b2)
+{
+	write_lock(&table_rwlock);
+}
+
+static void table_mutex_write_lock_buckets(struct rcuhashbash_bucket *b1,
+                                           struct rcuhashbash_bucket *b2)
+{
+	mutex_lock(&table_mutex);
+}
+
+static void spinlock_write_unlock_buckets(struct rcuhashbash_bucket *b1,
+                                          struct rcuhashbash_bucket *b2)
+{
+	spin_unlock(&b1->spinlock);
+	if (b1 != b2)
+		spin_unlock(&b2->spinlock);
+}
+
+static void rwlock_write_unlock_buckets(struct rcuhashbash_bucket *b1,
+                                        struct rcuhashbash_bucket *b2)
+{
+	write_unlock(&b1->rwlock);
+	if (b1 != b2)
+		write_unlock(&b2->rwlock);
+}
+
+static void mutex_write_unlock_buckets(struct rcuhashbash_bucket *b1,
+                                       struct rcuhashbash_bucket *b2)
+{
+	mutex_unlock(&b1->mutex);
+	if (b1 != b2)
+		mutex_unlock(&b2->mutex);
+}
+
+static void table_spinlock_write_unlock_buckets(struct rcuhashbash_bucket *b1,
+                                                struct rcuhashbash_bucket *b2)
+{
+	spin_unlock(&table_spinlock);
+}
+
+static void table_rwlock_write_unlock_buckets(struct rcuhashbash_bucket *b1,
+                                              struct rcuhashbash_bucket *b2)
+{
+	write_unlock(&table_rwlock);
+}
+
+static void table_mutex_write_unlock_buckets(struct rcuhashbash_bucket *b1,
+                                             struct rcuhashbash_bucket *b2)
+{
+	mutex_unlock(&table_mutex);
+}
+
+static struct rcuhashbash_ops all_ops[] = {
+	{
+		.reader_type = "rcu",
+		.writer_type = "single",
+		.max_writers = 1,
+	},
+	{
+		.reader_type = "rcu",
+		.writer_type = "spinlock",
+		.init_bucket = spinlock_init_bucket,
+		.write_lock_buckets = spinlock_write_lock_buckets,
+		.write_unlock_buckets = spinlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "rcu",
+		.writer_type = "rwlock",
+		.init_bucket = rwlock_init_bucket,
+		.write_lock_buckets = rwlock_write_lock_buckets,
+		.write_unlock_buckets = rwlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "rcu",
+		.writer_type = "mutex",
+		.init_bucket = mutex_init_bucket,
+		.write_lock_buckets = mutex_write_lock_buckets,
+		.write_unlock_buckets = mutex_write_unlock_buckets,
+	},
+	{
+		.reader_type = "rcu",
+		.writer_type = "table_spinlock",
+		.write_lock_buckets = table_spinlock_write_lock_buckets,
+		.write_unlock_buckets = table_spinlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "rcu",
+		.writer_type = "table_rwlock",
+		.write_lock_buckets = table_rwlock_write_lock_buckets,
+		.write_unlock_buckets = table_rwlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "rcu",
+		.writer_type = "table_mutex",
+		.write_lock_buckets = table_mutex_write_lock_buckets,
+		.write_unlock_buckets = table_mutex_write_unlock_buckets,
+	},
+};
+
+static struct rcuhashbash_ops *ops;
 
 static void rcuhashbash_print_stats(void)
 {
@@ -239,12 +446,14 @@ static void rcuhashbash_print_stats(void)
 
 	ws = writer_stats;
 
-	printk(KERN_ALERT "rcuhashbash summary: %lu buckets, %lu entries\n"
+	printk(KERN_ALERT "rcuhashbash summary: %d %s readers, %s writer\n"
+	       KERN_ALERT "rcuhashbash summary: %lu buckets, %lu entries\n"
 	       KERN_ALERT "rcuhashbash summary: writer %llu moves %llu dests in use %llu misses\n"
-	       KERN_ALERT "rcuhashbash summary: %d readers %llu hits %llu misses\n",
+	       KERN_ALERT "rcuhashbash summary: readers %llu hits %llu misses\n",
+	       readers, reader_type, writer_type,
 	       buckets, entries,
 	       ws.moves, ws.dests_in_use, ws.misses,
-	       readers, rs.hits, rs.misses);
+	       rs.hits, rs.misses);
 }
 
 static void rcuhashbash_exit(void)
@@ -274,7 +483,7 @@ static void rcuhashbash_exit(void)
 
 	if (hash_table) {
 		for (i = 0; i < buckets; i++) {
-			struct hlist_head *head = &hash_table[i];
+			struct hlist_head *head = &hash_table[i].head;
 			while (!hlist_empty(head)) {
 				struct rcuhashbash_entry *entry;
 				entry = hlist_entry(head->first, struct rcuhashbash_entry, node);
@@ -300,6 +509,17 @@ static __init int rcuhashbash_init(void)
 	int ret;
 	u32 i;
 
+	for (i = 0; i < ARRAY_SIZE(all_ops); i++)
+		if (strcmp(reader_type, all_ops[i].reader_type) == 0
+		    && strcmp(writer_type, all_ops[i].writer_type) == 0) {
+			ops = &all_ops[i];
+		}
+	if (!ops) {
+		printk(KERN_ALERT "rcuhashbash: No implementation with %s reader and %s writer\n",
+		       reader_type, writer_type);
+		return -EINVAL;
+	}
+
 	entry_cache = KMEM_CACHE(rcuhashbash_entry, 0);
 	if (!entry_cache)
 		goto enomem;
@@ -308,13 +528,17 @@ static __init int rcuhashbash_init(void)
 	if (!hash_table)
 		goto enomem;
 
+	if (ops->init_bucket)
+		for (i = 0; i < buckets; i++)
+			ops->init_bucket(&hash_table[i]);
+
 	for (i = 0; i < entries; i++) {
 		struct rcuhashbash_entry *entry;
 		entry = kmem_cache_zalloc(entry_cache, GFP_KERNEL);
 		if(!entry)
 			goto enomem;
 		entry->value = i;
-		hlist_add_head(&entry->node, &hash_table[entry->value % buckets]);
+		hlist_add_head(&entry->node, &hash_table[entry->value % buckets].head);
 	}
 
 	if (readers < 0)
