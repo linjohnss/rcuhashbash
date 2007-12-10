@@ -21,8 +21,9 @@ MODULE_DESCRIPTION("RCU hash algorithm test module.");
 MODULE_LICENSE("GPL");
 
 static char *reader_type = "rcu"; /* Reader implementation to benchmark */
-static char *writer_type = "single"; /* Writer implementation to benchmark */
+static char *writer_type = "spinlock"; /* Writer implementation to benchmark */
 static int readers = -1; /* Number of reader tasks; defaults to online CPUs */
+static int writers = -1; /* Number of writer tasks; defaults to online CPUs */
 static unsigned long buckets = 1024; /* Number of hash table buckets */
 static unsigned long entries = 4096; /* Number of entries initially added */
 
@@ -32,6 +33,8 @@ module_param(writer_type, charp, 0444);
 MODULE_PARM_DESC(writer_type, "Hash table writer implementation");
 module_param(readers, int, 0444);
 MODULE_PARM_DESC(readers, "Number of reader threads");
+module_param(writers, int, 0444);
+MODULE_PARM_DESC(writers, "Number of writer threads");
 module_param(buckets, ulong, 0444);
 MODULE_PARM_DESC(buckets, "Number of hash buckets");
 module_param(entries, ulong, 0444);
@@ -72,7 +75,7 @@ struct rcuhashbash_entry {
 static struct kmem_cache *entry_cache;
 
 static struct task_struct **reader_tasks;
-static struct task_struct *writer_task;
+static struct task_struct **writer_tasks;
 
 struct reader_stats {
 	u64 hits;
@@ -86,7 +89,7 @@ struct writer_stats {
 } ____cacheline_aligned_in_smp;
 
 struct reader_stats *reader_stats;
-struct writer_stats writer_stats;
+struct writer_stats *writer_stats;
 
 struct rcu_random_state {
 	unsigned long rrs_state;
@@ -444,13 +447,17 @@ static void rcuhashbash_print_stats(void)
 		rs.misses += reader_stats[i].misses;
 	}
 
-	ws = writer_stats;
+	for (i = 0; i < writers; i++) {
+		ws.moves += writer_stats[i].moves;
+		ws.dests_in_use += writer_stats[i].dests_in_use;
+		ws.misses += writer_stats[i].misses;
+	}
 
-	printk(KERN_ALERT "rcuhashbash summary: %d %s readers, %s writer\n"
-	       KERN_ALERT "rcuhashbash summary: %lu buckets, %lu entries\n"
-	       KERN_ALERT "rcuhashbash summary: writer %llu moves %llu dests in use %llu misses\n"
-	       KERN_ALERT "rcuhashbash summary: readers %llu hits %llu misses\n",
-	       readers, reader_type, writer_type,
+	printk(KERN_ALERT "rcuhashbash summary: readers=%d reader_type=%s writers=%d writer_type=%s\n"
+	       KERN_ALERT "rcuhashbash summary: buckets=%lu entries=%lu\n"
+	       KERN_ALERT "rcuhashbash summary: writers: %llu moves, %llu dests in use, %llu misses\n"
+	       KERN_ALERT "rcuhashbash summary: readers: %llu hits, %llu misses\n",
+	       readers, reader_type, writers, writer_type,
 	       buckets, entries,
 	       ws.moves, ws.dests_in_use, ws.misses,
 	       rs.hits, rs.misses);
@@ -461,11 +468,14 @@ static void rcuhashbash_exit(void)
 	unsigned long i;
 	int ret;
 
-	if (writer_task) {
-		ret = kthread_stop(writer_task);
-		if(ret)
-			printk(KERN_ALERT "rcuhashbash writer returned error %d\n", ret);
-		writer_task = NULL;
+	if (writer_tasks) {
+		for (i = 0; i < writers; i++)
+			if (writer_tasks[i]) {
+				ret = kthread_stop(writer_tasks[i]);
+				if(ret)
+					printk(KERN_ALERT "rcuhashbash writer returned error %d\n", ret);
+			}
+		kfree(writer_tasks);
 	}
 
 	if (reader_tasks) {
@@ -499,6 +509,7 @@ static void rcuhashbash_exit(void)
 
 	rcuhashbash_print_stats();
 
+	kfree(writer_stats);
 	kfree(reader_stats);
 
 	printk(KERN_ALERT "rcuhashbash done\n");
@@ -517,6 +528,16 @@ static __init int rcuhashbash_init(void)
 	if (!ops) {
 		printk(KERN_ALERT "rcuhashbash: No implementation with %s reader and %s writer\n",
 		       reader_type, writer_type);
+		return -EINVAL;
+	}
+
+	if (readers < 0)
+		readers = num_online_cpus();
+	if (writers < 0)
+		writers = num_online_cpus();
+	if (ops->max_writers && writers > ops->max_writers) {
+		printk(KERN_ALERT "rcuhashbash: %s writer implementation supports at most %d writers\n",
+		       writer_type, ops->max_writers);
 		return -EINVAL;
 	}
 
@@ -541,15 +562,20 @@ static __init int rcuhashbash_init(void)
 		hlist_add_head(&entry->node, &hash_table[entry->value % buckets].head);
 	}
 
-	if (readers < 0)
-		readers = num_online_cpus();
-
 	reader_stats = kcalloc(readers, sizeof(reader_stats[0]), GFP_KERNEL);
 	if (!reader_stats)
 		goto enomem;
 
 	reader_tasks = kcalloc(readers, sizeof(reader_tasks[0]), GFP_KERNEL);
 	if (!reader_tasks)
+		goto enomem;
+
+	writer_stats = kcalloc(writers, sizeof(writer_stats[0]), GFP_KERNEL);
+	if (!writer_stats)
+		goto enomem;
+
+	writer_tasks = kcalloc(writers, sizeof(writer_tasks[0]), GFP_KERNEL);
+	if (!writer_tasks)
 		goto enomem;
 
 	printk(KERN_ALERT "rcuhashbash starting threads\n");
@@ -565,12 +591,15 @@ static __init int rcuhashbash_init(void)
 		reader_tasks[i] = task;
 	}
 
-	writer_task = kthread_run(rcuhashbash_writer, &writer_stats,
-	                          "rcuhashbash_writer");
-	if (IS_ERR(writer_task)) {
-		ret = PTR_ERR(writer_task);
-		writer_task = NULL;
-		goto error;
+	for (i = 0; i < writers; i++) {
+		struct task_struct *task;
+		task = kthread_run(rcuhashbash_writer, &writer_stats[i],
+		                   "rcuhashbash_writer");
+		if (IS_ERR(task)) {
+			ret = PTR_ERR(task);
+			goto error;
+		}
+		writer_tasks[i] = task;
 	}
 
 	return 0;
