@@ -51,6 +51,10 @@ struct rcuhashbash_bucket {
 
 struct rcuhashbash_ops {
 	void (*init_bucket)(struct rcuhashbash_bucket *);
+	int (*reader_thread)(void *);
+	void (*read_lock_bucket)(struct rcuhashbash_bucket *);
+	void (*read_unlock_bucket)(struct rcuhashbash_bucket *);
+	int (*writer_thread)(void *);
 	void (*write_lock_buckets)(struct rcuhashbash_bucket *, struct rcuhashbash_bucket *);
 	void (*write_unlock_buckets)(struct rcuhashbash_bucket *, struct rcuhashbash_bucket *);
 	int max_writers;
@@ -118,7 +122,7 @@ rcu_random(struct rcu_random_state *rrsp)
 	return swahw32(rrsp->rrs_state);
 }
 
-static int rcuhashbash_reader(void *arg)
+static int rcuhashbash_reader_rcu(void *arg)
 {
 	struct reader_stats *stats = arg;
 	DEFINE_RCU_RANDOM(rand);
@@ -148,6 +152,39 @@ static int rcuhashbash_reader(void *arg)
 	return 0;
 }
 
+static int rcuhashbash_reader_lock(void *arg)
+{
+	struct reader_stats *stats = arg;
+	DEFINE_RCU_RANDOM(rand);
+
+	set_user_nice(current, 19);
+
+	do {
+		struct rcuhashbash_entry *entry;
+		struct hlist_node *node;
+		u32 value, bucket;
+
+		cond_resched();
+
+		value = rcu_random(&rand) % (entries * 2);
+		bucket = value % buckets;
+
+		if (ops->read_lock_bucket)
+			ops->read_lock_bucket(&hash_table[bucket]);
+		hlist_for_each_entry(entry, node, &hash_table[value % buckets].head, node)
+			if (entry->value == value)
+				break;
+		if (node)
+			stats->hits++;
+		else
+			stats->misses++;
+		if (ops->read_unlock_bucket)
+			ops->read_unlock_bucket(&hash_table[bucket]);
+	} while (!kthread_should_stop());
+
+	return 0;
+}
+
 static void rcuhashbash_entry_cb(struct rcu_head *rcu_head)
 {
 	struct rcuhashbash_entry *entry;
@@ -155,7 +192,7 @@ static void rcuhashbash_entry_cb(struct rcu_head *rcu_head)
 	kmem_cache_free(entry_cache, entry);
 }
 
-static int rcuhashbash_writer(void *arg)
+static int rcuhashbash_writer_rcu(void *arg)
 {
 	int err = 0;
 	struct writer_stats *stats = arg;
@@ -265,6 +302,82 @@ unlock_and_loop:
 	return err;
 }
 
+static int rcuhashbash_writer_lock(void *arg)
+{
+	struct writer_stats *stats = arg;
+	DEFINE_RCU_RANDOM(rand);
+
+	set_user_nice(current, 19);
+
+	do {
+		u32 src_value, src_bucket;
+		u32 dst_value, dst_bucket;
+		struct rcuhashbash_entry *entry = NULL;
+		struct hlist_node *node;
+		struct rcuhashbash_entry *src_entry = NULL;
+		bool same_bucket;
+		bool dest_in_use = false;
+
+		cond_resched();
+
+		src_value = rcu_random(&rand) % (entries * 2);
+		src_bucket = src_value % buckets;
+		dst_value = rcu_random(&rand) % (entries * 2);
+		dst_bucket = dst_value % buckets;
+		same_bucket = src_bucket == dst_bucket;
+
+		if (ops->write_lock_buckets)
+			ops->write_lock_buckets(&hash_table[src_bucket],
+			                        &hash_table[dst_bucket]);
+
+		/* Find src_entry. */
+		hlist_for_each_entry(entry, node, &hash_table[src_bucket].head, node) {
+			if (entry->value == src_value)
+				src_entry = entry;
+			if (same_bucket && entry->value == dst_value)
+				dest_in_use = true;
+		}
+		if (!src_entry) {
+			stats->misses++;
+			goto unlock_and_loop;
+		}
+		if (dest_in_use) {
+			stats->dests_in_use++;
+			goto unlock_and_loop;
+		}
+
+		if (same_bucket) {
+			src_entry->value = dst_value;
+			stats->moves++;
+			goto unlock_and_loop;
+		}
+
+		/* Check for existing destination. */
+		hlist_for_each_entry(entry, node, &hash_table[dst_bucket].head, node)
+			if (entry->value == dst_value) {
+				dest_in_use = true;
+				break;
+			}
+		if (dest_in_use) {
+			stats->dests_in_use++;
+			goto unlock_and_loop;
+		}
+
+		hlist_del(&src_entry->node);
+		src_entry->value = dst_value;
+		hlist_add_head(&src_entry->node, &hash_table[dst_bucket].head);
+
+		stats->moves++;
+
+unlock_and_loop:
+		if (ops->write_unlock_buckets)
+			ops->write_unlock_buckets(&hash_table[src_bucket],
+			                          &hash_table[dst_bucket]);
+	} while (!kthread_should_stop());
+
+	return 0;
+}
+
 static void spinlock_init_bucket(struct rcuhashbash_bucket *bucket)
 {
 	spin_lock_init(&bucket->spinlock);
@@ -278,6 +391,66 @@ static void rwlock_init_bucket(struct rcuhashbash_bucket *bucket)
 static void mutex_init_bucket(struct rcuhashbash_bucket *bucket)
 {
 	mutex_init(&bucket->mutex);
+}
+
+static void spinlock_read_lock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	spin_lock(&bucket->spinlock);
+}
+
+static void rwlock_read_lock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	read_lock(&bucket->rwlock);
+}
+
+static void mutex_read_lock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	mutex_lock(&bucket->mutex);
+}
+
+static void table_spinlock_read_lock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	spin_lock(&table_spinlock);
+}
+
+static void table_rwlock_read_lock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	read_lock(&table_rwlock);
+}
+
+static void table_mutex_read_lock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	mutex_lock(&table_mutex);
+}
+
+static void spinlock_read_unlock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	spin_unlock(&bucket->spinlock);
+}
+
+static void rwlock_read_unlock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	read_unlock(&bucket->rwlock);
+}
+
+static void mutex_read_unlock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	mutex_unlock(&bucket->mutex);
+}
+
+static void table_spinlock_read_unlock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	spin_unlock(&table_spinlock);
+}
+
+static void table_rwlock_read_unlock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	read_unlock(&table_rwlock);
+}
+
+static void table_mutex_read_unlock_bucket(struct rcuhashbash_bucket *bucket)
+{
+	mutex_unlock(&table_mutex);
 }
 
 static void spinlock_write_lock_buckets(struct rcuhashbash_bucket *b1,
@@ -386,12 +559,16 @@ static struct rcuhashbash_ops all_ops[] = {
 	{
 		.reader_type = "rcu",
 		.writer_type = "single",
+		.reader_thread = rcuhashbash_reader_rcu,
+		.writer_thread = rcuhashbash_writer_rcu,
 		.max_writers = 1,
 	},
 	{
 		.reader_type = "rcu",
 		.writer_type = "spinlock",
 		.init_bucket = spinlock_init_bucket,
+		.reader_thread = rcuhashbash_reader_rcu,
+		.writer_thread = rcuhashbash_writer_rcu,
 		.write_lock_buckets = spinlock_write_lock_buckets,
 		.write_unlock_buckets = spinlock_write_unlock_buckets,
 	},
@@ -399,6 +576,8 @@ static struct rcuhashbash_ops all_ops[] = {
 		.reader_type = "rcu",
 		.writer_type = "rwlock",
 		.init_bucket = rwlock_init_bucket,
+		.reader_thread = rcuhashbash_reader_rcu,
+		.writer_thread = rcuhashbash_writer_rcu,
 		.write_lock_buckets = rwlock_write_lock_buckets,
 		.write_unlock_buckets = rwlock_write_unlock_buckets,
 	},
@@ -406,24 +585,95 @@ static struct rcuhashbash_ops all_ops[] = {
 		.reader_type = "rcu",
 		.writer_type = "mutex",
 		.init_bucket = mutex_init_bucket,
+		.reader_thread = rcuhashbash_reader_rcu,
+		.writer_thread = rcuhashbash_writer_rcu,
 		.write_lock_buckets = mutex_write_lock_buckets,
 		.write_unlock_buckets = mutex_write_unlock_buckets,
 	},
 	{
 		.reader_type = "rcu",
 		.writer_type = "table_spinlock",
+		.reader_thread = rcuhashbash_reader_rcu,
+		.writer_thread = rcuhashbash_writer_rcu,
 		.write_lock_buckets = table_spinlock_write_lock_buckets,
 		.write_unlock_buckets = table_spinlock_write_unlock_buckets,
 	},
 	{
 		.reader_type = "rcu",
 		.writer_type = "table_rwlock",
+		.reader_thread = rcuhashbash_reader_rcu,
+		.writer_thread = rcuhashbash_writer_rcu,
 		.write_lock_buckets = table_rwlock_write_lock_buckets,
 		.write_unlock_buckets = table_rwlock_write_unlock_buckets,
 	},
 	{
 		.reader_type = "rcu",
 		.writer_type = "table_mutex",
+		.reader_thread = rcuhashbash_reader_rcu,
+		.writer_thread = rcuhashbash_writer_rcu,
+		.write_lock_buckets = table_mutex_write_lock_buckets,
+		.write_unlock_buckets = table_mutex_write_unlock_buckets,
+	},
+	{
+		.reader_type = "spinlock",
+		.writer_type = "spinlock",
+		.init_bucket = spinlock_init_bucket,
+		.reader_thread = rcuhashbash_reader_lock,
+		.read_lock_bucket = spinlock_read_lock_bucket,
+		.read_unlock_bucket = spinlock_read_unlock_bucket,
+		.writer_thread = rcuhashbash_writer_lock,
+		.write_lock_buckets = spinlock_write_lock_buckets,
+		.write_unlock_buckets = spinlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "rwlock",
+		.writer_type = "rwlock",
+		.init_bucket = rwlock_init_bucket,
+		.reader_thread = rcuhashbash_reader_lock,
+		.read_lock_bucket = rwlock_read_lock_bucket,
+		.read_unlock_bucket = rwlock_read_unlock_bucket,
+		.writer_thread = rcuhashbash_writer_lock,
+		.write_lock_buckets = rwlock_write_lock_buckets,
+		.write_unlock_buckets = rwlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "mutex",
+		.writer_type = "mutex",
+		.init_bucket = mutex_init_bucket,
+		.reader_thread = rcuhashbash_reader_lock,
+		.read_lock_bucket = mutex_read_lock_bucket,
+		.read_unlock_bucket = mutex_read_unlock_bucket,
+		.writer_thread = rcuhashbash_writer_lock,
+		.write_lock_buckets = mutex_write_lock_buckets,
+		.write_unlock_buckets = mutex_write_unlock_buckets,
+	},
+	{
+		.reader_type = "table_spinlock",
+		.writer_type = "table_spinlock",
+		.reader_thread = rcuhashbash_reader_lock,
+		.read_lock_bucket = table_spinlock_read_lock_bucket,
+		.read_unlock_bucket = table_spinlock_read_unlock_bucket,
+		.writer_thread = rcuhashbash_writer_lock,
+		.write_lock_buckets = table_spinlock_write_lock_buckets,
+		.write_unlock_buckets = table_spinlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "table_rwlock",
+		.writer_type = "table_rwlock",
+		.reader_thread = rcuhashbash_reader_lock,
+		.read_lock_bucket = table_rwlock_read_lock_bucket,
+		.read_unlock_bucket = table_rwlock_read_unlock_bucket,
+		.writer_thread = rcuhashbash_writer_lock,
+		.write_lock_buckets = table_rwlock_write_lock_buckets,
+		.write_unlock_buckets = table_rwlock_write_unlock_buckets,
+	},
+	{
+		.reader_type = "table_mutex",
+		.writer_type = "table_mutex",
+		.reader_thread = rcuhashbash_reader_lock,
+		.read_lock_bucket = table_mutex_read_lock_bucket,
+		.read_unlock_bucket = table_mutex_read_unlock_bucket,
+		.writer_thread = rcuhashbash_writer_lock,
 		.write_lock_buckets = table_mutex_write_lock_buckets,
 		.write_unlock_buckets = table_mutex_write_unlock_buckets,
 	},
@@ -530,6 +780,10 @@ static __init int rcuhashbash_init(void)
 		       reader_type, writer_type);
 		return -EINVAL;
 	}
+	if (!ops->reader_thread || !ops->writer_thread) {
+		printk(KERN_ALERT "rcuhashbash: Internal error: reader or writer thread NULL\n");
+		return -EINVAL;
+	}
 
 	if (readers < 0)
 		readers = num_online_cpus();
@@ -582,7 +836,7 @@ static __init int rcuhashbash_init(void)
 
 	for (i = 0; i < readers; i++) {
 		struct task_struct *task;
-		task = kthread_run(rcuhashbash_reader, &reader_stats[i],
+		task = kthread_run(ops->reader_thread, &reader_stats[i],
 		                   "rcuhashbash_reader");
 		if (IS_ERR(task)) {
 			ret = PTR_ERR(task);
@@ -593,7 +847,7 @@ static __init int rcuhashbash_init(void)
 
 	for (i = 0; i < writers; i++) {
 		struct task_struct *task;
-		task = kthread_run(rcuhashbash_writer, &writer_stats[i],
+		task = kthread_run(ops->writer_thread, &writer_stats[i],
 		                   "rcuhashbash_writer");
 		if (IS_ERR(task)) {
 			ret = PTR_ERR(task);
