@@ -57,6 +57,7 @@ struct rcuhashbash_ops {
 	int (*writer_thread)(void *);
 	void (*write_lock_buckets)(struct rcuhashbash_bucket *, struct rcuhashbash_bucket *);
 	void (*write_unlock_buckets)(struct rcuhashbash_bucket *, struct rcuhashbash_bucket *);
+	bool limit_writers;
 	int max_writers;
 	const char *reader_type;
 	const char *writer_type;
@@ -120,6 +121,34 @@ rcu_random(struct rcu_random_state *rrsp)
 	}
 	rrsp->rrs_state = rrsp->rrs_state * RCU_RANDOM_MULT + RCU_RANDOM_ADD;
 	return swahw32(rrsp->rrs_state);
+}
+
+static int rcuhashbash_reader_nosync(void *arg)
+{
+	struct reader_stats *stats = arg;
+	DEFINE_RCU_RANDOM(rand);
+
+	set_user_nice(current, 19);
+
+	do {
+		struct rcuhashbash_entry *entry;
+		struct hlist_node *node;
+		u32 value;
+
+		cond_resched();
+
+		value = rcu_random(&rand) % (entries * 2);
+
+		hlist_for_each_entry(entry, node, &hash_table[value % buckets].head, node)
+			if (entry->value == value)
+				break;
+		if (node)
+			stats->hits++;
+		else
+			stats->misses++;
+	} while (!kthread_should_stop());
+
+	return 0;
 }
 
 static int rcuhashbash_reader_rcu(void *arg)
@@ -557,10 +586,19 @@ static void table_mutex_write_unlock_buckets(struct rcuhashbash_bucket *b1,
 
 static struct rcuhashbash_ops all_ops[] = {
 	{
+		.reader_type = "nosync",
+		.writer_type = "none",
+		.reader_thread = rcuhashbash_reader_nosync,
+		.writer_thread = NULL,
+		.limit_writers = true,
+		.max_writers = 0,
+	},
+	{
 		.reader_type = "rcu",
 		.writer_type = "single",
 		.reader_thread = rcuhashbash_reader_rcu,
 		.writer_thread = rcuhashbash_writer_rcu,
+		.limit_writers = true,
 		.max_writers = 1,
 	},
 	{
@@ -780,18 +818,23 @@ static __init int rcuhashbash_init(void)
 		       reader_type, writer_type);
 		return -EINVAL;
 	}
-	if (!ops->reader_thread || !ops->writer_thread) {
-		printk(KERN_ALERT "rcuhashbash: Internal error: reader or writer thread NULL\n");
-		return -EINVAL;
-	}
 
 	if (readers < 0)
 		readers = num_online_cpus();
 	if (writers < 0)
 		writers = num_online_cpus();
-	if (ops->max_writers && writers > ops->max_writers) {
+	if (ops->limit_writers && writers > ops->max_writers) {
 		printk(KERN_ALERT "rcuhashbash: %s writer implementation supports at most %d writers\n",
 		       writer_type, ops->max_writers);
+		return -EINVAL;
+	}
+
+	if (readers > 0 && !ops->reader_thread) {
+		printk(KERN_ALERT "rcuhashbash: Internal error: readers > 0 but reader thread NULL\n");
+		return -EINVAL;
+	}
+	if (writers > 0 && !ops->writer_thread) {
+		printk(KERN_ALERT "rcuhashbash: Internal error: writers > 0 but writer thread NULL\n");
 		return -EINVAL;
 	}
 
