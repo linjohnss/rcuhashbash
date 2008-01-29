@@ -154,6 +154,37 @@ static int rcuhashbash_reader_nosync(void *arg)
 	return 0;
 }
 
+static int rcuhashbash_reader_nosync_rcu_dereference(void *arg)
+{
+	struct reader_stats *stats_ret = arg;
+	struct reader_stats stats = { 0 };
+	DEFINE_RCU_RANDOM(rand);
+
+	set_user_nice(current, 19);
+
+	do {
+		struct rcuhashbash_entry *entry;
+		struct hlist_node *node;
+		u32 value;
+
+		cond_resched();
+
+		value = rcu_random(&rand) % (entries * 2);
+
+		hlist_for_each_entry_rcu(entry, node, &hash_table[value % buckets].head, node)
+			if (entry->value == value)
+				break;
+		if (node)
+			stats.hits++;
+		else
+			stats.misses++;
+	} while (!kthread_should_stop());
+
+	*stats_ret = stats;
+
+	return 0;
+}
+
 static int rcuhashbash_reader_rcu(void *arg)
 {
 	struct reader_stats *stats_ret = arg;
@@ -604,6 +635,14 @@ static struct rcuhashbash_ops all_ops[] = {
 		.reader_type = "nosync",
 		.writer_type = "none",
 		.reader_thread = rcuhashbash_reader_nosync,
+		.writer_thread = NULL,
+		.limit_writers = true,
+		.max_writers = 0,
+	},
+	{
+		.reader_type = "nosync_rcu_dereference",
+		.writer_type = "none",
+		.reader_thread = rcuhashbash_reader_nosync_rcu_dereference,
 		.writer_thread = NULL,
 		.limit_writers = true,
 		.max_writers = 0,
