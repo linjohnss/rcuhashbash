@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
+#include <linux/seqlock.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -68,6 +69,7 @@ static struct rcuhashbash_ops *ops;
 static DEFINE_SPINLOCK(table_spinlock);
 static DEFINE_RWLOCK(table_rwlock);
 static DEFINE_MUTEX(table_mutex);
+static seqcount_t table_seqcount = SEQCNT_ZERO;
 
 static struct rcuhashbash_bucket *hash_table;
 
@@ -247,6 +249,46 @@ static int rcuhashbash_reader_lock(void *arg)
 			stats.misses++;
 		if (ops->read_unlock_bucket)
 			ops->read_unlock_bucket(&hash_table[bucket]);
+	} while (!kthread_should_stop());
+
+	*stats_ret = stats;
+
+	return 0;
+}
+
+static int rcuhashbash_reader_rcu_seq(void *arg)
+{
+	struct reader_stats *stats_ret = arg;
+	struct reader_stats stats = { 0 };
+	DEFINE_RCU_RANDOM(rand);
+
+	set_user_nice(current, 19);
+
+	do {
+		struct rcuhashbash_entry *entry;
+		struct hlist_node *node;
+		u32 value;
+		unsigned long seq;
+		bool found;
+
+		cond_resched();
+
+		value = rcu_random(&rand) % (entries * 2);
+
+		do {
+			seq = read_seqcount_begin(&table_seqcount);
+			rcu_read_lock();
+			hlist_for_each_entry_rcu(entry, node, &hash_table[value % buckets].head, node)
+				if (entry->value == value)
+					break;
+			found = node;
+			rcu_read_unlock();
+		} while (read_seqcount_retry(&table_seqcount, seq));
+
+		if (found)
+			stats.hits++;
+		else
+			stats.misses++;
 	} while (!kthread_should_stop());
 
 	*stats_ret = stats;
@@ -451,6 +493,87 @@ unlock_and_loop:
 	*stats_ret = stats;
 
 	return 0;
+}
+
+static int rcuhashbash_writer_rcu_seq(void *arg)
+{
+	int err = 0;
+	struct writer_stats *stats_ret = arg;
+	struct writer_stats stats = { 0 };
+	DEFINE_RCU_RANDOM(rand);
+
+	set_user_nice(current, 19);
+
+	do {
+		u32 src_value, src_bucket;
+		u32 dst_value, dst_bucket;
+		struct rcuhashbash_entry *entry = NULL;
+		struct hlist_node *node;
+		struct rcuhashbash_entry *src_entry = NULL;
+		bool same_bucket;
+		bool dest_in_use = false;
+
+		cond_resched();
+
+		src_value = rcu_random(&rand) % (entries * 2);
+		src_bucket = src_value % buckets;
+		dst_value = rcu_random(&rand) % (entries * 2);
+		dst_bucket = dst_value % buckets;
+		same_bucket = src_bucket == dst_bucket;
+
+		if (ops->write_lock_buckets)
+			ops->write_lock_buckets(&hash_table[src_bucket],
+			                        &hash_table[dst_bucket]);
+
+		/* Find src_entry. */
+		hlist_for_each_entry(entry, node, &hash_table[src_bucket].head, node) {
+			if (entry->value == src_value) {
+				src_entry = entry;
+				break;
+			}
+		}
+		if (!src_entry) {
+			stats.misses++;
+			goto unlock_and_loop;
+		}
+
+		/* Check for existing destination. */
+		hlist_for_each_entry(entry, node, &hash_table[dst_bucket].head, node) {
+			if (entry->value == dst_value) {
+				dest_in_use = true;
+				break;
+			}
+		}
+		if (dest_in_use) {
+			stats.dests_in_use++;
+			goto unlock_and_loop;
+		}
+
+		if (same_bucket) {
+			src_entry->value = dst_value;
+			stats.moves++;
+			goto unlock_and_loop;
+		}
+
+		write_seqcount_begin(&table_seqcount);
+		hlist_del_rcu(&src_entry->node);
+		hlist_add_head_rcu(&src_entry->node, &hash_table[dst_bucket].head);
+		src_entry->value = dst_value;
+		write_seqcount_end(&table_seqcount);
+
+		stats.moves++;
+
+unlock_and_loop:
+		if (ops->write_unlock_buckets)
+			ops->write_unlock_buckets(&hash_table[src_bucket],
+			                          &hash_table[dst_bucket]);
+	} while (!kthread_should_stop() && !err);
+
+	*stats_ret = stats;
+
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(1);
+	return err;
 }
 
 static void spinlock_init_bucket(struct rcuhashbash_bucket *bucket)
@@ -705,6 +828,15 @@ static struct rcuhashbash_ops all_ops[] = {
 		.writer_thread = rcuhashbash_writer_rcu,
 		.write_lock_buckets = table_mutex_write_lock_buckets,
 		.write_unlock_buckets = table_mutex_write_unlock_buckets,
+	},
+	{
+		.reader_type = "rcu_seq",
+		.writer_type = "spinlock",
+		.init_bucket = spinlock_init_bucket,
+		.reader_thread = rcuhashbash_reader_rcu_seq,
+		.writer_thread = rcuhashbash_writer_rcu_seq,
+		.write_lock_buckets = spinlock_write_lock_buckets,
+		.write_unlock_buckets = spinlock_write_unlock_buckets,
 	},
 	{
 		.reader_type = "spinlock",
