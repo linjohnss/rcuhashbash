@@ -831,6 +831,14 @@ static struct rcuhashbash_ops all_ops[] = {
 	},
 	{
 		.reader_type = "rcu_seq",
+		.writer_type = "single",
+		.reader_thread = rcuhashbash_reader_rcu_seq,
+		.writer_thread = rcuhashbash_writer_rcu_seq,
+		.limit_writers = true,
+		.max_writers = 1,
+	},
+	{
+		.reader_type = "rcu_seq",
 		.writer_type = "spinlock",
 		.init_bucket = spinlock_init_bucket,
 		.reader_thread = rcuhashbash_reader_rcu_seq,
