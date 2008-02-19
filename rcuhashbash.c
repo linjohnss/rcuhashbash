@@ -27,6 +27,8 @@ static int readers = -1; /* Number of reader tasks; defaults to online CPUs */
 static int writers = -1; /* Number of writer tasks; defaults to online CPUs */
 static unsigned long buckets = 1024; /* Number of hash table buckets */
 static unsigned long entries = 4096; /* Number of entries initially added */
+static unsigned long reader_range = 0; /* Upper bound of reader range */
+static unsigned long writer_range = 0; /* Upper bound of writer range */
 
 module_param(reader_type, charp, 0444);
 MODULE_PARM_DESC(reader_type, "Hash table reader implementation");
@@ -40,6 +42,10 @@ module_param(buckets, ulong, 0444);
 MODULE_PARM_DESC(buckets, "Number of hash buckets");
 module_param(entries, ulong, 0444);
 MODULE_PARM_DESC(entries, "Number of hash table entries");
+module_param(reader_range, ulong, 0444);
+MODULE_PARM_DESC(reader_range, "Upper bound of reader operating range (default 2*entries)");
+module_param(writer_range, ulong, 0444);
+MODULE_PARM_DESC(writer_range, "Upper bound of writer operating range (default 2*entries)");
 
 struct rcuhashbash_bucket {
 	struct hlist_head head;
@@ -140,7 +146,7 @@ static int rcuhashbash_reader_nosync(void *arg)
 
 		cond_resched();
 
-		value = rcu_random(&rand) % (entries * 2);
+		value = rcu_random(&rand) % reader_range;
 
 		hlist_for_each_entry(entry, node, &hash_table[value % buckets].head, node)
 			if (entry->value == value)
@@ -171,7 +177,7 @@ static int rcuhashbash_reader_nosync_rcu_dereference(void *arg)
 
 		cond_resched();
 
-		value = rcu_random(&rand) % (entries * 2);
+		value = rcu_random(&rand) % reader_range;
 
 		hlist_for_each_entry_rcu(entry, node, &hash_table[value % buckets].head, node)
 			if (entry->value == value)
@@ -202,7 +208,7 @@ static int rcuhashbash_reader_rcu(void *arg)
 
 		cond_resched();
 
-		value = rcu_random(&rand) % (entries * 2);
+		value = rcu_random(&rand) % reader_range;
 
 		rcu_read_lock();
 		hlist_for_each_entry_rcu(entry, node, &hash_table[value % buckets].head, node)
@@ -235,7 +241,7 @@ static int rcuhashbash_reader_lock(void *arg)
 
 		cond_resched();
 
-		value = rcu_random(&rand) % (entries * 2);
+		value = rcu_random(&rand) % reader_range;
 		bucket = value % buckets;
 
 		if (ops->read_lock_bucket)
@@ -273,7 +279,7 @@ static int rcuhashbash_reader_rcu_seq(void *arg)
 
 		cond_resched();
 
-		value = rcu_random(&rand) % (entries * 2);
+		value = rcu_random(&rand) % reader_range;
 
 		do {
 			seq = read_seqcount_begin(&table_seqcount);
@@ -326,9 +332,9 @@ static int rcuhashbash_writer_rcu(void *arg)
 
 		cond_resched();
 
-		src_value = rcu_random(&rand) % (entries * 2);
+		src_value = rcu_random(&rand) % writer_range;
 		src_bucket = src_value % buckets;
-		dst_value = rcu_random(&rand) % (entries * 2);
+		dst_value = rcu_random(&rand) % writer_range;
 		dst_bucket = dst_value % buckets;
 		same_bucket = src_bucket == dst_bucket;
 
@@ -435,9 +441,9 @@ static int rcuhashbash_writer_lock(void *arg)
 
 		cond_resched();
 
-		src_value = rcu_random(&rand) % (entries * 2);
+		src_value = rcu_random(&rand) % writer_range;
 		src_bucket = src_value % buckets;
-		dst_value = rcu_random(&rand) % (entries * 2);
+		dst_value = rcu_random(&rand) % writer_range;
 		dst_bucket = dst_value % buckets;
 		same_bucket = src_bucket == dst_bucket;
 
@@ -515,9 +521,9 @@ static int rcuhashbash_writer_rcu_seq(void *arg)
 
 		cond_resched();
 
-		src_value = rcu_random(&rand) % (entries * 2);
+		src_value = rcu_random(&rand) % writer_range;
 		src_bucket = src_value % buckets;
-		dst_value = rcu_random(&rand) % (entries * 2);
+		dst_value = rcu_random(&rand) % writer_range;
 		dst_bucket = dst_value % buckets;
 		same_bucket = src_bucket == dst_bucket;
 
@@ -978,11 +984,11 @@ static void rcuhashbash_print_stats(void)
 	}
 
 	printk(KERN_ALERT "rcuhashbash summary: readers=%d reader_type=%s writers=%d writer_type=%s\n"
-	       KERN_ALERT "rcuhashbash summary: buckets=%lu entries=%lu\n"
+	       KERN_ALERT "rcuhashbash summary: buckets=%lu entries=%lu reader_range=%lu writer_range=%lu\n"
 	       KERN_ALERT "rcuhashbash summary: writers: %llu moves, %llu dests in use, %llu misses\n"
 	       KERN_ALERT "rcuhashbash summary: readers: %llu hits, %llu misses\n",
 	       readers, reader_type, writers, writer_type,
-	       buckets, entries,
+	       buckets, entries, reader_range, writer_range,
 	       ws.moves, ws.dests_in_use, ws.misses,
 	       rs.hits, rs.misses);
 }
@@ -1073,6 +1079,11 @@ static __init int rcuhashbash_init(void)
 		printk(KERN_ALERT "rcuhashbash: Internal error: writers > 0 but writer thread NULL\n");
 		return -EINVAL;
 	}
+
+	if (reader_range == 0)
+		reader_range = 2*entries;
+	if (writer_range == 0)
+		writer_range = 2*entries;
 
 	entry_cache = KMEM_CACHE(rcuhashbash_entry, 0);
 	if (!entry_cache)
