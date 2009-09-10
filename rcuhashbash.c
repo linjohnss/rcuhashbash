@@ -3,7 +3,6 @@
  * Mostly lockless random number generator rcu_random from rcutorture, by Paul
  * McKenney and Josh Triplett.
  */
-#include <linux/dcache.h>
 #include <linux/init.h>
 #include <linux/kthread.h>
 #include <linux/list.h>
