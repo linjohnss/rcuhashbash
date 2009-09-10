@@ -3,7 +3,6 @@
  * Mostly lockless random number generator rcu_random from rcutorture, by Paul
  * McKenney and Josh Triplett.
  */
-#include <linux/byteorder/swabb.h>
 #include <linux/dcache.h>
 #include <linux/init.h>
 #include <linux/kthread.h>
@@ -16,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <asm/byteorder.h>
 
 MODULE_AUTHOR("Josh Triplett <josh@kernel.org>");
 MODULE_DESCRIPTION("RCU hash algorithm test module.");
