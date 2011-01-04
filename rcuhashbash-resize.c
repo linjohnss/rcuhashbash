@@ -124,27 +124,6 @@ static int rcuhashbash_read_rcu(u32 value, struct stats *stats)
 	return 0;
 }
 
-static int rcuhashbash_read_thread(void *arg)
-{
-	int err;
-	struct stats *stats_ret = arg;
-	struct stats stats = {};
-	DEFINE_RCU_RANDOM(rand);
-
-	set_user_nice(current, 19);
-
-	do {
-		cond_resched();
-		err = ops->read(rcu_random(&rand) % entries, &stats);
-	} while (!kthread_should_stop() && !err);
-
-	*stats_ret = stats;
-
-	while (!kthread_should_stop())
-		schedule_timeout_interruptible(1);
-	return err;
-}
-
 static struct hlist_node **hlist_advance_last_next(struct hlist_node **old_last_next)
 {
 	struct hlist_head h = { .first = *old_last_next };
@@ -250,6 +229,27 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 
 	stats->resizes++;
 	return 0;
+}
+
+static int rcuhashbash_read_thread(void *arg)
+{
+	int err;
+	struct stats *stats_ret = arg;
+	struct stats stats = {};
+	DEFINE_RCU_RANDOM(rand);
+
+	set_user_nice(current, 19);
+
+	do {
+		cond_resched();
+		err = ops->read(rcu_random(&rand) % entries, &stats);
+	} while (!kthread_should_stop() && !err);
+
+	*stats_ret = stats;
+
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(1);
+	return err;
 }
 
 static int rcuhashbash_resize_thread(void *arg)
