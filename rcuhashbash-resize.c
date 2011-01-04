@@ -119,13 +119,8 @@ static int rcuhashbash_read_rcu(u32 value, struct stats *stats)
 	rcu_read_lock();
 	if (rcuhashbash_try_lookup(rcu_dereference(table), value))
 		stats->read_hits++;
-	else {
-		struct rcuhashbash_table *table2_local = rcu_dereference(table2);
-		if (unlikely(table2_local) && rcuhashbash_try_lookup(table2_local, value))
-			stats->read_hits_fallback++;
-		else
-			stats->read_misses++;
-	}
+	else
+		stats->read_misses++;
 	rcu_read_unlock();
 
 	return 0;
@@ -173,65 +168,56 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 		BUG_ON(new_table != table);
 	} else if (mask2 > table->mask) {
 		/* Grow. */
-		struct rcuhashbash_table *temp_table;
+		struct rcuhashbash_table *temp_table, *old_table;
 		bool moved_one;
+
 		/* Explicitly avoid in-place growth, to simplify the algorithm. */
 		temp_table = kzalloc(sizeof(*table) + len2 * sizeof(table->buckets[0]), GFP_KERNEL);
 		temp_table->mask = mask2;
-		rcu_assign_pointer(table2, temp_table);
-
-		/* Move nodes. */
-		while (true) {
-			moved_one = false;
-			/* Move a suffix of nodes from each bucket. */
-			for (i = 0; i <= table->mask; i++) {
-				struct rcuhashbash_entry *entry;
-				struct hlist_node *node;
-				struct hlist_node *suffix_start = NULL;
-				struct hlist_node *last;
-				unsigned long target_bucket = ~0UL;
-
-				if (hlist_empty(&table->buckets[i]))
-					continue;
-				moved_one = true;
-
-				suffix_start = NULL;
-				hlist_for_each_entry(entry, node, &table->buckets[i], node) {
-					if (!suffix_start || (entry->value & table2->mask) != target_bucket) {
-						suffix_start = node;
-						target_bucket = entry->value & table2->mask;
-					}
-					last = node;
-				}
-
-				last->next = table2->buckets[target_bucket].first;
-				if (last->next)
-					last->next->pprev = &last->next;
-				rcu_assign_pointer(table2->buckets[target_bucket].first, suffix_start);
-				/* Don't set table2->buckets[i].first->pprev
-				 * yet; use it to find the suffix in the next
-				 * pass to un-cross-link. */
-			}
-			if (!moved_one)
-				break;
-
-			/* Make sure current readers can successfully finish,
-			 * finding nodes via the cross-links. */
-			synchronize_rcu();
-			/* Fix all the cross-linking. */
-			for (i = 0; i <= table2->mask; i++)
-				if (table2->buckets[i].first && table2->buckets[i].first->pprev != &table2->buckets[i].first) {
-					*table2->buckets[i].first->pprev = NULL;
-					table2->buckets[i].first->pprev = &table2->buckets[i].first;
+		for (i = 0; i <= mask2; i++) {
+			struct rcuhashbash_entry *entry;
+			struct hlist_node *node;
+			hlist_for_each_entry(entry, node, &table->buckets[i & table->mask], node)
+				if ((entry->value & mask2) == i) {
+					temp_table->buckets[i].first = node;
+					node->pprev = &temp_table->buckets[i].first;
+                                        break;
 				}
 		}
-
-		/* Make the larger table the new primary table. */
-		temp_table = table;
-		rcu_assign_pointer(table, table2);
+		/* We now have a valid hash table, albeit with buckets zipped together. */
+		old_table = table;
+		rcu_assign_pointer(table, temp_table);
 		synchronize_rcu();
-		kfree(temp_table);
-		table2 = NULL;
+
+		/* Unzip the buckets */
+		do {
+			moved_one = false;
+			for (i = 0; i <= old_table->mask; i ++) {
+				struct rcuhashbash_entry *entry_prev, *entry;
+				struct hlist_node *node;
+				if (hlist_empty(&old_table->buckets[i]))
+					continue;
+				entry_prev = hlist_entry(old_table->buckets[i].first, struct rcuhashbash_entry, node);
+				hlist_for_each_entry(entry, node, &old_table->buckets[i], node) {
+					if ((entry->value & mask2) != (entry_prev->value & mask2))
+						break;
+					entry_prev = entry;
+				}
+				old_table->buckets[i].first = node;
+				if (!node)
+					continue;
+				moved_one = true;
+				hlist_for_each_entry(entry, node, &old_table->buckets[i], node)
+					if ((entry->value & mask2) == (entry_prev->value & mask2))
+						break;
+				entry_prev->node.next = node;
+				if (node)
+					node->pprev = &entry_prev->node.next;
+			}
+			synchronize_rcu();
+		} while (moved_one);
+
+		kfree(old_table);
 	}
 
 	stats->resizes++;
@@ -440,7 +426,7 @@ static void rcuhashbash_exit(void)
 			while (!hlist_empty(head)) {
 				struct rcuhashbash_entry *entry;
 				entry = hlist_entry(head->first, struct rcuhashbash_entry, node);
-				hlist_del(head->first);
+                                head->first = entry->node.next;
 				kmem_cache_free(entry_cache, entry);
 			}
 		}
