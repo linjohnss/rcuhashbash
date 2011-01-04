@@ -115,10 +115,13 @@ static int rcuhashbash_read_rcu(u32 value, struct stats *stats)
 	rcu_read_lock();
 	if (rcuhashbash_try_lookup(rcu_dereference(table), value))
 		stats->read_hits++;
-	else if (rcuhashbash_try_lookup(rcu_dereference(table2), value))
-		stats->read_hits_fallback++;
-	else
-		stats->read_misses++;
+	else {
+		struct rcuhashbash_table *table2_local = rcu_dereference(table2);
+		if (unlikely(table2_local) && rcuhashbash_try_lookup(table2_local, value))
+			stats->read_hits_fallback++;
+		else
+			stats->read_misses++;
+	}
 	rcu_read_unlock();
 
 	return 0;
