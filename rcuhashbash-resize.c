@@ -19,17 +19,18 @@ MODULE_LICENSE("GPL");
 
 static char *test = "rcu"; /* Hash table implementation to benchmark */
 static int readers = -1;
-static u8 initial_buckets_shift = 10;
-static unsigned long entries = 4096;
+static u8 shift1 = 13;
+static u8 shift2 = 14;
+static unsigned long entries = 65536;
 
 module_param(test, charp, 0444);
 MODULE_PARM_DESC(test, "Hash table implementation");
 module_param(readers, int, 0444);
 MODULE_PARM_DESC(readers, "Number of reader threads (default: number of online CPUs)");
-#if 0
-module_param(initial_buckets_shift, byte, 0444);
-MODULE_PARM_DESC(initial_buckets_shift, "Initial number of hash buckets, log 2");
-#endif
+module_param(shift1, byte, 0444);
+MODULE_PARM_DESC(shift1, "Initial number of hash buckets, log 2");
+module_param(shift2, byte, 0444);
+MODULE_PARM_DESC(shift2, "Number of hash buckets after resize, log 2");
 module_param(entries, ulong, 0444);
 MODULE_PARM_DESC(entries, "Number of hash table entries");
 
@@ -155,7 +156,7 @@ static struct hlist_node **hlist_advance_last_next(struct hlist_node **old_last_
 
 static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 {
-	unsigned long len2 = 1LLU << new_buckets_shift;
+	unsigned long len2 = 1UL << new_buckets_shift;
 	unsigned long mask2 = len2 - 1;
 	unsigned long i, j;
 
@@ -258,7 +259,7 @@ static int rcuhashbash_resize_thread(void *arg)
 
 	do {
 		cond_resched();
-		err = ops->resize(initial_buckets_shift + (table->mask == ((1LLU << initial_buckets_shift) - 1)), &stats);
+		err = ops->resize(table->mask == (1UL << shift1) - 1 ? shift2 : shift1, &stats);
 	} while (!kthread_should_stop() && !err);
 
 	*stats_ret = stats;
@@ -297,12 +298,12 @@ static void rcuhashbash_print_stats(void)
 
 	printk(KERN_ALERT
 	       "rcuhashbash summary: test=%s readers=%d\n"
-	       "rcuhashbash summary: buckets=%llu entries=%lu\n"
+	       "rcuhashbash summary: entries=%lu shift1=%u (%lu buckets) shift2=%u (%lu buckets)\n"
 	       "rcuhashbash summary: reads: %llu primary hits, %llu fallback hits, %llu misses\n"
 	       "rcuhashbash summary: resizes: %llu\n"
 	       "rcuhashbash summary: %s\n",
 	       test, readers,
-	       1LLU << initial_buckets_shift, entries,
+	       entries, shift1, 1UL << shift1, shift2, 1UL << shift2,
 	       s.read_hits, s.read_hits_fallback, s.read_misses,
 	       s.resizes,
 	       s.read_misses == 0 ? "PASS" : "FAIL");
@@ -385,11 +386,11 @@ static __init int rcuhashbash_init(void)
 	if (!entry_cache)
 		goto enomem;
 
-	table = kzalloc(sizeof(table) + (1LLU << initial_buckets_shift) * sizeof(table->buckets[0]), GFP_KERNEL);
+	table = kzalloc(sizeof(table) + (1UL << shift1) * sizeof(table->buckets[0]), GFP_KERNEL);
 	if (!table)
 		goto enomem;
 
-	table->mask = (1LLU << initial_buckets_shift) - 1;
+	table->mask = (1UL << shift1) - 1;
 
 	for (i = 0; i < entries; i++) {
 		struct rcuhashbash_entry *entry;
