@@ -392,7 +392,7 @@ static __init int rcuhashbash_init(void)
 	if (!entry_cache)
 		goto enomem;
 
-	table = kzalloc(sizeof(table) + (1UL << shift1) * sizeof(table->buckets[0]), GFP_KERNEL);
+	table = kzalloc(sizeof(*table) + (1UL << shift1) * sizeof(table->buckets[0]), GFP_KERNEL);
 	if (!table)
 		goto enomem;
 
