@@ -19,6 +19,7 @@ MODULE_LICENSE("GPL");
 
 static char *test = "rcu"; /* Hash table implementation to benchmark */
 static int readers = -1;
+static bool resize = true;
 static u8 shift1 = 13;
 static u8 shift2 = 14;
 static unsigned long entries = 65536;
@@ -27,6 +28,8 @@ module_param(test, charp, 0444);
 MODULE_PARM_DESC(test, "Hash table implementation");
 module_param(readers, int, 0444);
 MODULE_PARM_DESC(readers, "Number of reader threads (default: number of online CPUs)");
+module_param(resize, bool, 0444);
+MODULE_PARM_DESC(resize, "Whether to run a resize thread (default: true)");
 module_param(shift1, byte, 0444);
 MODULE_PARM_DESC(shift1, "Initial number of hash buckets, log 2");
 module_param(shift2, byte, 0444);
@@ -289,7 +292,7 @@ static void rcuhashbash_print_stats(void)
 		return;
 	}
 
-	for (i = 0; i < readers + 1; i++) {
+	for (i = 0; i < readers + resize; i++) {
 		s.read_hits += thread_stats[i].read_hits;
 		s.read_hits_fallback += thread_stats[i].read_hits_fallback;
 		s.read_misses += thread_stats[i].read_misses;
@@ -297,12 +300,12 @@ static void rcuhashbash_print_stats(void)
 	}
 
 	printk(KERN_ALERT
-	       "rcuhashbash summary: test=%s readers=%d\n"
+	       "rcuhashbash summary: test=%s readers=%d resize=%s\n"
 	       "rcuhashbash summary: entries=%lu shift1=%u (%lu buckets) shift2=%u (%lu buckets)\n"
 	       "rcuhashbash summary: reads: %llu primary hits, %llu fallback hits, %llu misses\n"
 	       "rcuhashbash summary: resizes: %llu\n"
 	       "rcuhashbash summary: %s\n",
-	       test, readers,
+	       test, readers, resize ? "true" : "false",
 	       entries, shift1, 1UL << shift1, shift2, 1UL << shift2,
 	       s.read_hits, s.read_hits_fallback, s.read_misses,
 	       s.resizes,
@@ -315,7 +318,7 @@ static void rcuhashbash_exit(void)
 	int ret;
 
 	if (tasks) {
-		for (i = 0; i < readers + 1; i++)
+		for (i = 0; i < readers + resize; i++)
 			if (tasks[i]) {
 				ret = kthread_stop(tasks[i]);
 				if(ret)
@@ -401,17 +404,17 @@ static __init int rcuhashbash_init(void)
 		hlist_add_head(&entry->node, &table->buckets[i & table->mask]);
 	}
 
-	thread_stats = kcalloc(readers + 1, sizeof(thread_stats[0]), GFP_KERNEL);
+	thread_stats = kcalloc(readers + resize, sizeof(thread_stats[0]), GFP_KERNEL);
 	if (!thread_stats)
 		goto enomem;
 
-	tasks = kcalloc(readers + 1, sizeof(tasks[0]), GFP_KERNEL);
+	tasks = kcalloc(readers + resize, sizeof(tasks[0]), GFP_KERNEL);
 	if (!tasks)
 		goto enomem;
 
 	printk(KERN_ALERT "rcuhashbash starting threads\n");
 
-	for (i = 0; i < readers + 1; i++) {
+	for (i = 0; i < readers + resize; i++) {
 		struct task_struct *task;
 		if (i < readers)
 			task = kthread_run(rcuhashbash_read_thread,
