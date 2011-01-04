@@ -2,6 +2,7 @@
  * Written by Josh Triplett
  * Mostly lockless random number generator rcu_random from rcutorture, by Paul
  * McKenney and Josh Triplett.
+ * ddds implementation based on work by Nick Piggin.
  */
 #include <linux/init.h>
 #include <linux/kthread.h>
@@ -43,8 +44,9 @@ struct rcuhashbash_table {
 };
 
 struct stats {
-	u64 read_hits;
-	u64 read_hits_fallback;
+	u64 read_hits;          /* Primary table hits */
+	u64 read_hits_fallback; /* Fallback (secondary table) hits */
+	u64 read_hits_slowpath; /* Slowpath primary table hits (if applicable) */
 	u64 read_misses;
 	u64 resizes;
 };
@@ -59,6 +61,8 @@ static struct rcuhashbash_ops *ops;
 
 static struct rcuhashbash_table *table;
 static struct rcuhashbash_table *table2;
+
+static seqcount_t seqcount;
 
 struct rcuhashbash_entry {
 	struct hlist_node node;
@@ -234,6 +238,92 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 	return 0;
 }
 
+static noinline bool ddds_lookup_slowpath(struct rcuhashbash_table *cur, struct rcuhashbash_table *old, u32 value, struct stats *stats)
+{
+	unsigned seq;
+
+	do {
+		seq = read_seqcount_begin(&seqcount);
+		if (rcuhashbash_try_lookup(cur, value)) {
+			stats->read_hits_slowpath++;
+			return true;
+		}
+		if (rcuhashbash_try_lookup(old, value)) {
+			stats->read_hits_fallback++;
+			return true;
+		}
+	} while (read_seqcount_retry(&seqcount, seq));
+
+	stats->read_misses++;
+	return false;
+}
+
+static int rcuhashbash_read_ddds(u32 value, struct stats *stats)
+{
+	struct rcuhashbash_table *cur, *old;
+
+	rcu_read_lock();
+	cur = table;
+	old = table2;
+	if (unlikely(old))
+		ddds_lookup_slowpath(cur, old, value, stats);
+	else if (rcuhashbash_try_lookup(cur, value))
+		stats->read_hits++;
+	else
+		stats->read_misses++;
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static void ddds_move_nodes(struct rcuhashbash_table *old, struct rcuhashbash_table *new)
+{
+	unsigned long i, oldsize;
+
+	oldsize = old->mask + 1;
+	for (i = 0; i < oldsize; i++) {
+		struct hlist_head *head = &old->buckets[i];
+
+		while (!hlist_empty(head)) {
+			struct rcuhashbash_entry *entry;
+
+			/* don't get preempted while holding resize_seq */
+			preempt_disable();
+			write_seqcount_begin(&seqcount);
+			entry = hlist_entry(head->first, struct rcuhashbash_entry, node);
+			hlist_del_rcu(&entry->node);
+			hlist_add_head_rcu(&entry->node, &new->buckets[entry->value & new->mask]);
+			write_seqcount_end(&seqcount);
+			preempt_enable();
+			cond_resched();
+			cpu_relax();
+		}
+	}
+}
+
+static int rcuhashbash_resize_ddds(u8 new_buckets_shift, struct stats *stats)
+{
+	/* table2 == d_hash_old, table == d_hash_cur */
+	struct rcuhashbash_table *new, *old;
+	new = kzalloc(sizeof(*table) + (1UL << new_buckets_shift) * sizeof(table->buckets[0]), GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+	new->mask = (1UL << new_buckets_shift) - 1;
+
+	table2 = table;
+	synchronize_rcu();
+	table = new;
+	synchronize_rcu();
+	ddds_move_nodes(table2, table);
+	synchronize_rcu();
+	old = table2;
+	table2 = NULL;
+	synchronize_rcu();
+	kfree(old);
+
+	return 0;
+}
+
 static int rcuhashbash_read_thread(void *arg)
 {
 	int err;
@@ -281,6 +371,11 @@ static struct rcuhashbash_ops all_ops[] = {
 		.read = rcuhashbash_read_rcu,
 		.resize = rcuhashbash_resize,
 	},
+	{
+		.test = "ddds",
+		.read = rcuhashbash_read_ddds,
+		.resize = rcuhashbash_resize_ddds,
+	},
 };
 
 static struct rcuhashbash_ops *ops;
@@ -297,6 +392,7 @@ static void rcuhashbash_print_stats(void)
 
 	for (i = 0; i < readers + resize; i++) {
 		s.read_hits += thread_stats[i].read_hits;
+		s.read_hits_slowpath += thread_stats[i].read_hits_slowpath;
 		s.read_hits_fallback += thread_stats[i].read_hits_fallback;
 		s.read_misses += thread_stats[i].read_misses;
 		s.resizes += thread_stats[i].resizes;
@@ -305,12 +401,12 @@ static void rcuhashbash_print_stats(void)
 	printk(KERN_ALERT
 	       "rcuhashbash summary: test=%s readers=%d resize=%s\n"
 	       "rcuhashbash summary: entries=%lu shift1=%u (%lu buckets) shift2=%u (%lu buckets)\n"
-	       "rcuhashbash summary: reads: %llu primary hits, %llu fallback hits, %llu misses\n"
+	       "rcuhashbash summary: reads: %llu primary hits, %llu slowpath primary hits, %llu secondary hits, %llu misses\n"
 	       "rcuhashbash summary: resizes: %llu\n"
 	       "rcuhashbash summary: %s\n",
 	       test, readers, resize ? "true" : "false",
 	       entries, shift1, 1UL << shift1, shift2, 1UL << shift2,
-	       s.read_hits, s.read_hits_fallback, s.read_misses,
+	       s.read_hits, s.read_hits_slowpath, s.read_hits_fallback, s.read_misses,
 	       s.resizes,
 	       s.read_misses == 0 ? "PASS" : "FAIL");
 }
