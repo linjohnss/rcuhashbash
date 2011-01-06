@@ -181,7 +181,7 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 				if ((entry->value & mask2) == i) {
 					temp_table->buckets[i].first = node;
 					node->pprev = &temp_table->buckets[i].first;
-                                        break;
+					break;
 				}
 		}
 		/* We now have a valid hash table, albeit with buckets zipped together. */
@@ -426,7 +426,7 @@ static void rcuhashbash_exit(void)
 			while (!hlist_empty(head)) {
 				struct rcuhashbash_entry *entry;
 				entry = hlist_entry(head->first, struct rcuhashbash_entry, node);
-                                head->first = entry->node.next;
+				head->first = entry->node.next;
 				kmem_cache_free(entry_cache, entry);
 			}
 		}
