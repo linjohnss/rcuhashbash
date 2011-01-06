@@ -307,6 +307,8 @@ static int rcuhashbash_resize_ddds(u8 new_buckets_shift, struct stats *stats)
 	synchronize_rcu();
 	kfree(old);
 
+	stats->resizes++;
+
 	return 0;
 }
 
