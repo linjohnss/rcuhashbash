@@ -63,6 +63,7 @@ static struct rcuhashbash_table *table;
 static struct rcuhashbash_table *table2;
 
 static seqcount_t seqcount;
+static DEFINE_RWLOCK(rwlock);
 
 struct rcuhashbash_entry {
 	struct hlist_node node;
@@ -312,6 +313,47 @@ static int rcuhashbash_resize_ddds(u8 new_buckets_shift, struct stats *stats)
 	return 0;
 }
 
+static int rcuhashbash_read_rwlock(u32 value, struct stats *stats)
+{
+	read_lock(&rwlock);
+	if (rcuhashbash_try_lookup(table, value))
+		stats->read_hits++;
+	else
+		stats->read_misses++;
+	read_unlock(&rwlock);
+
+	return 0;
+}
+
+static int rcuhashbash_resize_rwlock(u8 new_buckets_shift, struct stats *stats)
+{
+	struct rcuhashbash_table *new;
+	unsigned long i;
+
+	new = kzalloc(sizeof(*table) + (1UL << new_buckets_shift) * sizeof(table->buckets[0]), GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+	new->mask = (1UL << new_buckets_shift) - 1;
+
+	write_lock(&rwlock);
+	for (i = 0; i <= table->mask; i++) {
+		struct hlist_head *head = &table->buckets[i];
+
+		while (!hlist_empty(head)) {
+			struct rcuhashbash_entry *entry = hlist_entry(head->first, struct rcuhashbash_entry, node);
+			hlist_del_rcu(&entry->node);
+			hlist_add_head_rcu(&entry->node, &new->buckets[entry->value & new->mask]);
+		}
+	}
+	kfree(table);
+	table = new;
+	write_unlock(&rwlock);
+
+	stats->resizes++;
+
+	return 0;
+}
+
 static int rcuhashbash_read_thread(void *arg)
 {
 	int err;
@@ -363,6 +405,11 @@ static struct rcuhashbash_ops all_ops[] = {
 		.test = "ddds",
 		.read = rcuhashbash_read_ddds,
 		.resize = rcuhashbash_resize_ddds,
+	},
+	{
+		.test = "rwlock",
+		.read = rcuhashbash_read_rwlock,
+		.resize = rcuhashbash_resize_rwlock,
 	},
 };
 
