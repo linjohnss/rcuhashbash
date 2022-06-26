@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <asm/byteorder.h>
+#include <linux/sched/clock.h>
 
 MODULE_AUTHOR("Josh Triplett <josh@kernel.org>");
 MODULE_DESCRIPTION("RCU hash table resizing algorithm test module.");
@@ -88,6 +89,8 @@ struct rcu_random_state {
 
 #define DEFINE_RCU_RANDOM(name) struct rcu_random_state name = { 0, 0 }
 
+s64 start, end;
+
 /*
  * Crude but fast random-number generator.  Uses a linear congruential
  * generator, with occasional help from cpu_clock().
@@ -109,7 +112,7 @@ static bool rcuhashbash_try_lookup(struct rcuhashbash_table *t, u32 value)
 	struct rcuhashbash_entry *entry;
 	struct hlist_node *node;
 
-	hlist_for_each_entry_rcu(entry, node, &t->buckets[value & t->mask], node)
+	hlist_for_each_entry_rcu(entry, &t->buckets[value & t->mask], node)
 		if (entry->value == value)
 			return true;
 	return false;
@@ -165,7 +168,7 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 		table->mask = mask2;
 		synchronize_rcu();
 		/* Assume (and assert) that __krealloc shrinks in place. */
-		new_table = __krealloc(table, sizeof(*table) + len2 * sizeof(table->buckets[0]), GFP_KERNEL);
+		new_table = krealloc(table, sizeof(*table) + len2 * sizeof(table->buckets[0]), GFP_KERNEL);
 		BUG_ON(new_table != table);
 	} else if (mask2 > table->mask) {
 		/* Grow. */
@@ -178,10 +181,10 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 		for (i = 0; i <= mask2; i++) {
 			struct rcuhashbash_entry *entry;
 			struct hlist_node *node;
-			hlist_for_each_entry(entry, node, &table->buckets[i & table->mask], node)
+			hlist_for_each_entry(entry, &table->buckets[i & table->mask], node)
 				if ((entry->value & mask2) == i) {
-					temp_table->buckets[i].first = node;
-					node->pprev = &temp_table->buckets[i].first;
+					temp_table->buckets[i].first = &entry->node;
+					entry->node.pprev = &temp_table->buckets[i].first;
 					break;
 				}
 		}
@@ -199,21 +202,21 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 				if (hlist_empty(&old_table->buckets[i]))
 					continue;
 				entry_prev = hlist_entry(old_table->buckets[i].first, struct rcuhashbash_entry, node);
-				hlist_for_each_entry(entry, node, &old_table->buckets[i], node) {
+				hlist_for_each_entry(entry, &old_table->buckets[i], node) {
 					if ((entry->value & mask2) != (entry_prev->value & mask2))
 						break;
 					entry_prev = entry;
 				}
-				old_table->buckets[i].first = node;
-				if (!node)
+				old_table->buckets[i].first = &entry->node;
+				if (!&entry->node)
 					continue;
 				moved_one = true;
-				hlist_for_each_entry(entry, node, &old_table->buckets[i], node)
+				hlist_for_each_entry(entry, &old_table->buckets[i], node)
 					if ((entry->value & mask2) == (entry_prev->value & mask2))
 						break;
-				entry_prev->node.next = node;
-				if (node)
-					node->pprev = &entry_prev->node.next;
+				entry_prev->node.next = &entry->node;
+				if (&entry->node)
+					entry->node.pprev = &entry_prev->node.next;
 			}
 			synchronize_rcu();
 		} while (moved_one);
@@ -438,19 +441,20 @@ static void rcuhashbash_print_stats(void)
 	       "rcuhashbash summary: entries=%lu shift1=%u (%lu buckets) shift2=%u (%lu buckets)\n"
 	       "rcuhashbash summary: reads: %llu primary hits, %llu slowpath primary hits, %llu secondary hits, %llu misses\n"
 	       "rcuhashbash summary: resizes: %llu\n"
-	       "rcuhashbash summary: %s\n",
+	       "rcuhashbash summary: %s\n"
+		   "rcuhashbash summary: totak time: %llu ns\n",
 	       test, readers, resize ? "true" : "false",
 	       entries, shift1, 1UL << shift1, shift2, 1UL << shift2,
 	       s.read_hits, s.read_hits_slowpath, s.read_hits_fallback, s.read_misses,
 	       s.resizes,
-	       s.read_misses == 0 ? "PASS" : "FAIL");
+	       s.read_misses == 0 ? "PASS" : "FAIL",
+		   end - start);
 }
 
 static void rcuhashbash_exit(void)
 {
 	unsigned long i;
 	int ret;
-
 	if (tasks) {
 		for (i = 0; i < readers + resize; i++)
 			if (tasks[i]) {
@@ -460,6 +464,7 @@ static void rcuhashbash_exit(void)
 			}
 		kfree(tasks);
 	}
+	end = ktime_get_ns();
 
 	/* Wait for all RCU callbacks to complete. */
 	rcu_barrier();
@@ -547,7 +552,7 @@ static __init int rcuhashbash_init(void)
 		goto enomem;
 
 	printk(KERN_ALERT "rcuhashbash starting threads\n");
-
+	start = ktime_get_ns();
 	for (i = 0; i < readers + resize; i++) {
 		struct task_struct *task;
 		if (i < readers)
